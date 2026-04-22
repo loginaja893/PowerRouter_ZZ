@@ -107,3 +107,112 @@ class Conflict(AppError):
 
 
 class BadRequest(AppError):
+    pass
+
+
+class Unauthorized(AppError):
+    pass
+
+
+class RateLimited(AppError):
+    pass
+
+
+class Integrity(AppError):
+    pass
+
+
+@dataclasses.dataclass(frozen=True)
+class AppConfig:
+    app_name: str
+    http_host: str
+    http_port: int
+    db_path: str
+    log_level: str
+    hmac_secret_b64u: str
+    admin_token: str
+    allow_private_ips: bool
+    max_body_bytes: int
+    request_rate_window_s: int
+    request_rate_limit: int
+    match_batch_limit: int
+    match_lookback_s: int
+
+    @staticmethod
+    def load(env: t.Mapping[str, str] | None = None) -> "AppConfig":
+        if env is None:
+            env = os.environ
+
+        def g(key: str, default: str) -> str:
+            v = env.get(key, default)
+            return v if v is not None else default
+
+        app_name = g("POWERROUTER_APP", "PowerRouter_ZZ")
+        http_host = g("POWERROUTER_HOST", "127.0.0.1")
+        http_port = int(g("POWERROUTER_PORT", "8787"))
+        db_path = g("POWERROUTER_DB", os.path.join(os.getcwd(), "powerrouter_zz.sqlite3"))
+        log_level = g("POWERROUTER_LOG", "INFO")
+        hmac_secret = g("POWERROUTER_HMAC_SECRET", "")
+        admin_token = g("POWERROUTER_ADMIN_TOKEN", "")
+        allow_private = g("POWERROUTER_ALLOW_PRIVATE_IPS", "1").strip() not in ("0", "false", "False")
+        max_body_bytes = int(g("POWERROUTER_MAX_BODY", "1048576"))
+        rate_window = int(g("POWERROUTER_RATE_WINDOW_S", "12"))
+        rate_limit = int(g("POWERROUTER_RATE_LIMIT", "220"))
+        match_batch_limit = int(g("POWERROUTER_MATCH_BATCH", "256"))
+        match_lookback_s = int(g("POWERROUTER_MATCH_LOOKBACK_S", "86400"))
+
+        if not hmac_secret:
+            hmac_secret = rand_token(32)
+        if not admin_token:
+            admin_token = rand_token(24)
+
+        # Normalize secret to urlsafe b64
+        try:
+            _ = b64u_decode(hmac_secret)
+            hmac_secret_b64u = hmac_secret
+        except Exception:
+            hmac_secret_b64u = b64u(hmac_secret.encode("utf-8"))
+
+        return AppConfig(
+            app_name=app_name,
+            http_host=http_host,
+            http_port=http_port,
+            db_path=db_path,
+            log_level=log_level.upper(),
+            hmac_secret_b64u=hmac_secret_b64u,
+            admin_token=admin_token,
+            allow_private_ips=allow_private,
+            max_body_bytes=max_body_bytes,
+            request_rate_window_s=rate_window,
+            request_rate_limit=rate_limit,
+            match_batch_limit=match_batch_limit,
+            match_lookback_s=match_lookback_s,
+        )
+
+
+def configure_logging(level: str) -> None:
+    logging.basicConfig(
+        level=getattr(logging, level, logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+    )
+
+
+def sqlite_connect(path: str) -> sqlite3.Connection:
+    conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=5000")
+    return conn
+
+
+def _migrations() -> list[tuple[int, str]]:
+    return [
+        (
+            1,
+            """
+            CREATE TABLE IF NOT EXISTS pr_meta(
+              k TEXT PRIMARY KEY,
+              v TEXT NOT NULL
+            );
