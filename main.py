@@ -870,3 +870,112 @@ class Storage:
         )
 
     def list_offers(self, *, status: str = "open", limit: int = 200) -> list[Offer]:
+        limit = max(1, min(int(limit), 2000))
+        cur = self.conn.execute(
+            "SELECT offer_id FROM pr_offers WHERE status=? ORDER BY created_at DESC LIMIT ?",
+            (status, limit),
+        )
+        return [self.get_offer(r["offer_id"]) for r in cur.fetchall()]
+
+    def close_offer(self, *, actor: str, offer_id: str, reason: str) -> Offer:
+        reason = _must_nonempty_str(reason, what="reason", max_len=140)
+        row = self.conn.execute("SELECT status FROM pr_offers WHERE offer_id=?", (offer_id,)).fetchone()
+        if row is None:
+            raise NotFound("offer not found")
+        if row["status"] != "open":
+            raise Conflict("offer not open")
+        self.conn.execute("UPDATE pr_offers SET status=? WHERE offer_id=?", ("closed", offer_id))
+        self._audit(actor, "offer.close", offer_id, {"reason": reason})
+        return self.get_offer(offer_id)
+
+    # ---- tickets ----
+
+    def create_ticket(
+        self,
+        *,
+        actor: str,
+        client_id: str,
+        valid_until: str,
+        deliver_by: str,
+        token_symbol: str,
+        max_total: float,
+        units: int,
+        req: TicketReq,
+        meta: TJSON,
+    ) -> Ticket:
+        client_id = _must_nonempty_str(client_id, what="client_id", max_len=120)
+        token_symbol = _validate_token_symbol(token_symbol)
+        max_total = _safe_float(max_total, what="max_total")
+        if max_total <= 0:
+            raise BadRequest("max_total must be > 0")
+        units = _safe_int(units, what="units")
+        if units <= 0:
+            raise BadRequest("units must be > 0")
+
+        vu = parse_iso_utc(valid_until)
+        db = parse_iso_utc(deliver_by)
+        now = utc_now()
+        if vu <= now:
+            raise BadRequest("valid_until must be in the future")
+        if db <= now:
+            raise BadRequest("deliver_by must be in the future")
+        if db <= vu:
+            raise BadRequest("deliver_by must be after valid_until")
+        if (db - now).total_seconds() < 600:
+            raise BadRequest("deliver_by too soon")
+        if (db - now).total_seconds() > 60 * 60 * 24 * 19:
+            raise BadRequest("deliver_by too far")
+
+        if len(json_dumps(meta).encode("utf-8")) > 14_000:
+            raise BadRequest("meta too large")
+
+        ticket_id = "tix_" + uuid.uuid4().hex
+        created_at = iso_utc()
+        req_hash = req.hash()
+        self.conn.execute(
+            "INSERT INTO pr_tickets(ticket_id,client_id,created_at,valid_until,deliver_by,token_symbol,max_total,units,req_hash,req_json,meta_json,status) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                ticket_id,
+                client_id,
+                created_at,
+                iso_utc(vu),
+                iso_utc(db),
+                token_symbol,
+                max_total,
+                units,
+                req_hash,
+                json_dumps(dataclasses.asdict(req), pretty=False),
+                json_dumps(meta, pretty=False),
+                "open",
+            ),
+        )
+        self._audit(actor, "ticket.create", ticket_id, {"client_id": client_id, "token_symbol": token_symbol, "max_total": max_total, "units": units, "req": dataclasses.asdict(req)})
+        return self.get_ticket(ticket_id)
+
+    def get_ticket(self, ticket_id: str) -> Ticket:
+        row = self.conn.execute(
+            "SELECT ticket_id,client_id,created_at,valid_until,deliver_by,token_symbol,max_total,units,req_hash,req_json,meta_json,status "
+            "FROM pr_tickets WHERE ticket_id=?",
+            (ticket_id,),
+        ).fetchone()
+        if row is None:
+            raise NotFound("ticket not found")
+        req = _coerce_req(json.loads(row["req_json"]))
+        meta = json.loads(row["meta_json"])
+        return Ticket(
+            ticket_id=row["ticket_id"],
+            client_id=row["client_id"],
+            created_at=row["created_at"],
+            valid_until=row["valid_until"],
+            deliver_by=row["deliver_by"],
+            token_symbol=row["token_symbol"],
+            max_total=float(row["max_total"]),
+            units=int(row["units"]),
+            req_hash=row["req_hash"],
+            req=req,
+            meta=t.cast(TJSON, meta),
+            status=row["status"],
+        )
+
+    def list_tickets(self, *, status: str = "open", limit: int = 200) -> list[Ticket]:
