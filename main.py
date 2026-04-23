@@ -1633,3 +1633,99 @@ def run_server(cfg: AppConfig) -> None:
 
     srv = ThreadedHTTPServer((cfg.http_host, cfg.http_port), Handler, app)
     LOG.info("listening on http://%s:%d", cfg.http_host, cfg.http_port)
+    LOG.info("db=%s", cfg.db_path)
+    LOG.info("admin_token=%s", cfg.admin_token)
+
+    stop = threading.Event()
+
+    def _sig(*_: t.Any) -> None:
+        stop.set()
+
+    try:
+        signal.signal(signal.SIGINT, _sig)
+        signal.signal(signal.SIGTERM, _sig)
+    except Exception:
+        pass
+
+    try:
+        while not stop.is_set():
+            srv.handle_request()
+    finally:
+        try:
+            srv.server_close()
+        except Exception:
+            pass
+        app.close()
+
+
+def cli_suggest(cfg: AppConfig, args: argparse.Namespace) -> None:
+    configure_logging(cfg.log_level)
+    app = App(cfg)
+    try:
+        picks = app.matcher.suggest_matches(limit=args.limit)
+        print(json_dumps({"suggestions": picks}, pretty=True))
+    finally:
+        app.close()
+
+
+def cli_execute(cfg: AppConfig, args: argparse.Namespace) -> None:
+    configure_logging(cfg.log_level)
+    app = App(cfg)
+    try:
+        actor = args.actor or "cli"
+        out = app.matcher.execute_best(actor=actor, limit=args.limit)
+        print(json_dumps({"matches": [dataclasses.asdict(m) for m in out]}, pretty=True))
+    finally:
+        app.close()
+
+def cli_mint_token(cfg: AppConfig, args: argparse.Namespace) -> None:
+    configure_logging(cfg.log_level)
+    app = App(cfg)
+    try:
+        tok = app.issue_actor_token(args.actor_id, ttl_s=args.ttl_s)
+        print(json_dumps({"token": tok, "actor_id": args.actor_id, "ttl_s": args.ttl_s}, pretty=True))
+    finally:
+        app.close()
+
+def build_cli() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="PowerRouter_ZZ", description="Compute matching platform (CLI + HTTP API)")
+    sp = p.add_subparsers(dest="cmd", required=True)
+
+    s = sp.add_parser("serve", help="run HTTP API server")
+    s.set_defaults(fn=lambda cfg, a: run_server(cfg))
+
+    s = sp.add_parser("suggest", help="suggest best matches")
+    s.add_argument("--limit", type=int, default=50)
+    s.set_defaults(fn=cli_suggest)
+
+    s = sp.add_parser("execute", help="execute N best matches")
+    s.add_argument("--limit", type=int, default=1)
+    s.add_argument("--actor", type=str, default="cli")
+    s.set_defaults(fn=cli_execute)
+
+    s = sp.add_parser("mint-actor-token", help="mint a bearer token for actor auth")
+    s.add_argument("actor_id", type=str)
+    s.add_argument("--ttl-s", type=int, default=6 * 3600)
+    s.set_defaults(fn=cli_mint_token)
+
+    return p
+
+def main(argv: list[str] | None = None) -> int:
+    if argv is None:
+        argv = list(os.sys.argv[1:])
+    cfg = AppConfig.load()
+    p = build_cli()
+    args = p.parse_args(argv)
+    try:
+        fn = getattr(args, "fn")
+        fn(cfg, args)
+        return 0
+    except AppError as e:
+        print(json_dumps({"error": str(e), "ts": iso_utc()}, pretty=True))
+        return 2
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
