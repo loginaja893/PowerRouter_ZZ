@@ -1415,3 +1415,112 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "rate_limit": cfg.request_rate_limit,
                     "match_batch": cfg.match_batch_limit,
                     "match_lookback_s": cfg.match_lookback_s,
+                },
+            )
+
+        # admin: token mint
+        if method == "POST" and parts == ["admin", "actor-token"]:
+            self.app.require_admin(self)
+            body = parse_json_body(self, cfg.max_body_bytes)
+            actor_id = _must_nonempty_str(body.get("actor_id", ""), what="actor_id", max_len=120)
+            ttl_s = _safe_int(body.get("ttl_s", 6 * 3600), what="ttl_s")
+            tok = self.app.issue_actor_token(actor_id, ttl_s=ttl_s)
+            return json_response(self, 200, {"token": tok, "actor_id": actor_id, "ttl_s": ttl_s})
+
+        actor = self.app.actor_from_request(self)
+
+        # providers
+        if method == "GET" and parts == ["providers"]:
+            qp = qparams(self.path)
+            state = qp.get("state")
+            limit = int(qp.get("limit", "200"))
+            providers = self.app.st.list_providers(state=state, limit=limit)
+            return json_response(self, 200, {"items": [dataclasses.asdict(p) | {"caps": dataclasses.asdict(p.caps)} for p in providers]})
+        if method == "GET" and len(parts) == 2 and parts[0] == "providers":
+            p = self.app.st.get_provider(parts[1])
+            return json_response(self, 200, {"provider": dataclasses.asdict(p) | {"caps": dataclasses.asdict(p.caps)}})
+        if method == "POST" and parts == ["providers"]:
+            body = parse_json_body(self, cfg.max_body_bytes)
+            caps = _coerce_caps(t.cast(TJSON, body.get("caps", {})))
+            meta = t.cast(TJSON, body.get("meta", {})) if isinstance(body.get("meta", {}), dict) else {}
+            stake = _safe_float(body.get("stake", 0.0), what="stake")
+            payout_ref = _must_nonempty_str(body.get("payout_ref", "pay:" + rand_slug(18)), what="payout_ref", max_len=240)
+            display_name = body.get("display_name")
+            if display_name is not None:
+                display_name = _must_nonempty_str(display_name, what="display_name", max_len=120)
+            prov = self.app.st.upsert_provider(
+                actor=actor,
+                provider_id=None,
+                display_name=t.cast(str | None, display_name),
+                payout_ref=payout_ref,
+                stake=stake,
+                caps=caps,
+                meta=meta,
+            )
+            return json_response(self, 201, {"provider": dataclasses.asdict(prov) | {"caps": dataclasses.asdict(prov.caps)}})
+        if method == "POST" and len(parts) == 3 and parts[0] == "providers" and parts[2] == "state":
+            body = parse_json_body(self, cfg.max_body_bytes)
+            state = _must_nonempty_str(body.get("state", ""), what="state", max_len=24)
+            prov = self.app.st.set_provider_state(actor=actor, provider_id=parts[1], state=state)
+            return json_response(self, 200, {"provider": dataclasses.asdict(prov) | {"caps": dataclasses.asdict(prov.caps)}})
+
+        # offers
+        if method == "GET" and parts == ["offers"]:
+            qp = qparams(self.path)
+            status = qp.get("status", "open")
+            limit = int(qp.get("limit", "200"))
+            offers = self.app.st.list_offers(status=status, limit=limit)
+            items = []
+            for o in offers:
+                items.append(dataclasses.asdict(o) | {"caps": dataclasses.asdict(o.caps)})
+            return json_response(self, 200, {"items": items})
+        if method == "GET" and len(parts) == 2 and parts[0] == "offers":
+            o = self.app.st.get_offer(parts[1])
+            return json_response(self, 200, {"offer": dataclasses.asdict(o) | {"caps": dataclasses.asdict(o.caps)}})
+        if method == "POST" and parts == ["offers"]:
+            body = parse_json_body(self, cfg.max_body_bytes)
+            provider_id = _must_nonempty_str(body.get("provider_id", ""), what="provider_id", max_len=100)
+            token_symbol = _validate_token_symbol(str(body.get("token_symbol", "ETH")))
+            unit_price = _safe_float(body.get("unit_price", 1.0), what="unit_price")
+            capacity_units = _safe_int(body.get("capacity_units", 1), what="capacity_units")
+            mins = _safe_int(body.get("valid_mins", 90), what="valid_mins")
+            if mins < 5 or mins > 24 * 60:
+                raise BadRequest("valid_mins out of range")
+            valid_until = iso_utc(utc_now() + _dt.timedelta(minutes=mins))
+            terms = t.cast(TJSON, body.get("terms", {})) if isinstance(body.get("terms", {}), dict) else {}
+            offer = self.app.st.create_offer(
+                actor=actor,
+                provider_id=provider_id,
+                valid_until=valid_until,
+                token_symbol=token_symbol,
+                unit_price=unit_price,
+                capacity_units=capacity_units,
+                terms=terms,
+            )
+            return json_response(self, 201, {"offer": dataclasses.asdict(offer) | {"caps": dataclasses.asdict(offer.caps)}})
+        if method == "POST" and len(parts) == 3 and parts[0] == "offers" and parts[2] == "close":
+            body = parse_json_body(self, cfg.max_body_bytes)
+            reason = _must_nonempty_str(body.get("reason", "manual"), what="reason", max_len=140)
+            offer = self.app.st.close_offer(actor=actor, offer_id=parts[1], reason=reason)
+            return json_response(self, 200, {"offer": dataclasses.asdict(offer) | {"caps": dataclasses.asdict(offer.caps)}})
+
+        # tickets
+        if method == "GET" and parts == ["tickets"]:
+            qp = qparams(self.path)
+            status = qp.get("status", "open")
+            limit = int(qp.get("limit", "200"))
+            tickets = self.app.st.list_tickets(status=status, limit=limit)
+            items = []
+            for k in tickets:
+                items.append(dataclasses.asdict(k) | {"req": dataclasses.asdict(k.req)})
+            return json_response(self, 200, {"items": items})
+        if method == "GET" and len(parts) == 2 and parts[0] == "tickets":
+            k = self.app.st.get_ticket(parts[1])
+            return json_response(self, 200, {"ticket": dataclasses.asdict(k) | {"req": dataclasses.asdict(k.req)}})
+        if method == "POST" and parts == ["tickets"]:
+            body = parse_json_body(self, cfg.max_body_bytes)
+            client_id = _must_nonempty_str(body.get("client_id", "cli_" + rand_slug(10)), what="client_id", max_len=120)
+            token_symbol = _validate_token_symbol(str(body.get("token_symbol", "ETH")))
+            max_total = _safe_float(body.get("max_total", 10.0), what="max_total")
+            units = _safe_int(body.get("units", 1), what="units")
+            valid_mins = _safe_int(body.get("valid_mins", 30), what="valid_mins")
