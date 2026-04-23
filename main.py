@@ -652,3 +652,112 @@ class RateBucket:
         self.limit = int(limit)
         self._lock = threading.Lock()
         self._buckets: dict[str, list[int]] = {}
+
+    def hit(self, key: str) -> None:
+        now = int(time.time())
+        with self._lock:
+            hist = self._buckets.get(key)
+            if hist is None:
+                hist = []
+                self._buckets[key] = hist
+            cutoff = now - self.window_s
+            while hist and hist[0] < cutoff:
+                hist.pop(0)
+            if len(hist) >= self.limit:
+                raise RateLimited("rate limit")
+            hist.append(now)
+
+
+class Storage:
+    def __init__(self, conn: sqlite3.Connection):
+        self.conn = conn
+
+    def _audit(self, actor: str, action: str, target: str, payload: TJSON) -> None:
+        aid = "aud_" + uuid.uuid4().hex
+        created_at = iso_utc()
+        payload_json = json_dumps(payload, pretty=False)
+        h = audit_hash(action, payload)
+        self.conn.execute(
+            "INSERT INTO pr_audit(audit_id,created_at,actor,action,target,payload_json,h) VALUES(?,?,?,?,?,?,?)",
+            (aid, created_at, actor, action, target, payload_json, h),
+        )
+
+    def list_audit(self, *, limit: int = 200) -> list[TJSON]:
+        limit = max(1, min(int(limit), 1000))
+        cur = self.conn.execute(
+            "SELECT audit_id,created_at,actor,action,target,payload_json,h FROM pr_audit ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        )
+        rows = []
+        for r in cur.fetchall():
+            d = dict_row(r)
+            d["payload"] = json.loads(d.pop("payload_json"))
+            rows.append(d)
+        return rows
+
+    # ---- providers ----
+
+    def upsert_provider(
+        self,
+        *,
+        actor: str,
+        provider_id: str | None,
+        display_name: str | None,
+        payout_ref: str,
+        stake: float,
+        caps: ProviderCaps,
+        meta: TJSON,
+    ) -> Provider:
+        if provider_id is None:
+            provider_id = "prov_" + uuid.uuid4().hex
+        if display_name is None:
+            display_name = _random_display_name()
+        now = iso_utc()
+        stake = _safe_float(stake, what="stake")
+        if stake < 0:
+            raise BadRequest("stake must be >= 0")
+        payout_ref = _must_nonempty_str(payout_ref, what="payout_ref", max_len=240)
+        if len(json_dumps(meta).encode("utf-8")) > 12_000:
+            raise BadRequest("meta too large")
+        caps_json = json_dumps(dataclasses.asdict(caps), pretty=False)
+        meta_json = json_dumps(meta, pretty=False)
+
+        row = self.conn.execute(
+            "SELECT provider_id,created_at,updated_at,state,display_name,payout_ref,score,stake,caps_json,meta_json "
+            "FROM pr_providers WHERE provider_id=?",
+            (provider_id,),
+        ).fetchone()
+        if row is None:
+            created = now
+            score = float(0.85 + random.random() * 0.25)
+            self.conn.execute(
+                "INSERT INTO pr_providers(provider_id,created_at,updated_at,state,display_name,payout_ref,score,stake,caps_json,meta_json) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (provider_id, created, now, "active", display_name, payout_ref, score, stake, caps_json, meta_json),
+            )
+            self._audit(actor, "provider.create", provider_id, {"display_name": display_name, "stake": stake, "caps": dataclasses.asdict(caps)})
+        else:
+            self.conn.execute(
+                "UPDATE pr_providers SET updated_at=?, display_name=?, payout_ref=?, stake=?, caps_json=?, meta_json=? WHERE provider_id=?",
+                (now, display_name, payout_ref, stake, caps_json, meta_json, provider_id),
+            )
+            self._audit(actor, "provider.update", provider_id, {"display_name": display_name, "stake": stake, "caps": dataclasses.asdict(caps)})
+        return self.get_provider(provider_id)
+
+    def get_provider(self, provider_id: str) -> Provider:
+        row = self.conn.execute(
+            "SELECT provider_id,created_at,updated_at,state,display_name,payout_ref,score,stake,caps_json,meta_json "
+            "FROM pr_providers WHERE provider_id=?",
+            (provider_id,),
+        ).fetchone()
+        if row is None:
+            raise NotFound("provider not found")
+        caps = _coerce_caps(json.loads(row["caps_json"]))
+        meta = json.loads(row["meta_json"])
+        return Provider(
+            provider_id=row["provider_id"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            state=row["state"],
+            display_name=row["display_name"],
+            payout_ref=row["payout_ref"],
