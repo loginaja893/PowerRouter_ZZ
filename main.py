@@ -216,3 +216,112 @@ def _migrations() -> list[tuple[int, str]]:
               k TEXT PRIMARY KEY,
               v TEXT NOT NULL
             );
+            """,
+        ),
+        (
+            2,
+            """
+            CREATE TABLE IF NOT EXISTS pr_providers(
+              provider_id TEXT PRIMARY KEY,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              state TEXT NOT NULL,
+              display_name TEXT NOT NULL,
+              payout_ref TEXT NOT NULL,
+              score REAL NOT NULL,
+              stake REAL NOT NULL,
+              caps_json TEXT NOT NULL,
+              meta_json TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS pr_providers_state ON pr_providers(state);
+            """,
+        ),
+        (
+            3,
+            """
+            CREATE TABLE IF NOT EXISTS pr_offers(
+              offer_id TEXT PRIMARY KEY,
+              provider_id TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              valid_until TEXT NOT NULL,
+              token_symbol TEXT NOT NULL,
+              unit_price REAL NOT NULL,
+              capacity_units INTEGER NOT NULL,
+              caps_hash TEXT NOT NULL,
+              caps_json TEXT NOT NULL,
+              terms_json TEXT NOT NULL,
+              status TEXT NOT NULL,
+              FOREIGN KEY(provider_id) REFERENCES pr_providers(provider_id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS pr_offers_provider ON pr_offers(provider_id);
+            CREATE INDEX IF NOT EXISTS pr_offers_status ON pr_offers(status);
+            """,
+        ),
+        (
+            4,
+            """
+            CREATE TABLE IF NOT EXISTS pr_tickets(
+              ticket_id TEXT PRIMARY KEY,
+              client_id TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              valid_until TEXT NOT NULL,
+              deliver_by TEXT NOT NULL,
+              token_symbol TEXT NOT NULL,
+              max_total REAL NOT NULL,
+              units INTEGER NOT NULL,
+              req_hash TEXT NOT NULL,
+              req_json TEXT NOT NULL,
+              meta_json TEXT NOT NULL,
+              status TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS pr_tickets_status ON pr_tickets(status);
+            CREATE INDEX IF NOT EXISTS pr_tickets_client ON pr_tickets(client_id);
+            """,
+        ),
+        (
+            5,
+            """
+            CREATE TABLE IF NOT EXISTS pr_matches(
+              match_id TEXT PRIMARY KEY,
+              created_at TEXT NOT NULL,
+              ticket_id TEXT NOT NULL,
+              offer_id TEXT NOT NULL,
+              provider_id TEXT NOT NULL,
+              units INTEGER NOT NULL,
+              total_price REAL NOT NULL,
+              score REAL NOT NULL,
+              state TEXT NOT NULL,
+              result_hash TEXT,
+              meta_json TEXT NOT NULL,
+              FOREIGN KEY(ticket_id) REFERENCES pr_tickets(ticket_id) ON DELETE CASCADE,
+              FOREIGN KEY(offer_id) REFERENCES pr_offers(offer_id) ON DELETE CASCADE,
+              FOREIGN KEY(provider_id) REFERENCES pr_providers(provider_id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS pr_matches_ticket ON pr_matches(ticket_id);
+            CREATE INDEX IF NOT EXISTS pr_matches_state ON pr_matches(state);
+            """,
+        ),
+        (
+            6,
+            """
+            CREATE TABLE IF NOT EXISTS pr_audit(
+              audit_id TEXT PRIMARY KEY,
+              created_at TEXT NOT NULL,
+              actor TEXT NOT NULL,
+              action TEXT NOT NULL,
+              target TEXT NOT NULL,
+              payload_json TEXT NOT NULL,
+              h TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS pr_audit_actor ON pr_audit(actor);
+            CREATE INDEX IF NOT EXISTS pr_audit_action ON pr_audit(action);
+            """,
+        ),
+        (
+            7,
+            """
+            CREATE TABLE IF NOT EXISTS pr_credits(
+              owner_id TEXT NOT NULL,
+              token_symbol TEXT NOT NULL,
+              balance REAL NOT NULL,
+              updated_at TEXT NOT NULL,
