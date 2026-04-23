@@ -1088,3 +1088,112 @@ class Storage:
                 offer.provider_id,
                 units,
                 total_price,
+                score,
+                "matched",
+                None,
+                json_dumps(meta, pretty=False),
+            ),
+        )
+
+        # Reserve capacity immediately and close ticket + offer (simple, safe default).
+        self.conn.execute("UPDATE pr_tickets SET status=? WHERE ticket_id=?", ("matched", ticket_id))
+        self.conn.execute("UPDATE pr_offers SET status=? WHERE offer_id=?", ("matched", offer_id))
+
+        # Credit escrow to "router" then pay provider later (sim).
+        self.credit(actor=actor, owner_id="router", token_symbol=ticket.token_symbol, delta=total_price, reason="escrow.lock")
+
+        self._audit(actor, "match.create", match_id, {"ticket_id": ticket_id, "offer_id": offer_id, "units": units, "total_price": total_price, "score": score})
+        return self.get_match(match_id)
+
+    def get_match(self, match_id: str) -> Match:
+        row = self.conn.execute(
+            "SELECT match_id,created_at,ticket_id,offer_id,provider_id,units,total_price,score,state,result_hash,meta_json "
+            "FROM pr_matches WHERE match_id=?",
+            (match_id,),
+        ).fetchone()
+        if row is None:
+            raise NotFound("match not found")
+        meta = json.loads(row["meta_json"])
+        return Match(
+            match_id=row["match_id"],
+            created_at=row["created_at"],
+            ticket_id=row["ticket_id"],
+            offer_id=row["offer_id"],
+            provider_id=row["provider_id"],
+            units=int(row["units"]),
+            total_price=float(row["total_price"]),
+            score=float(row["score"]),
+            state=row["state"],
+            result_hash=row["result_hash"],
+            meta=t.cast(TJSON, meta),
+        )
+
+    def list_matches(self, *, state: str | None = None, limit: int = 200) -> list[Match]:
+        limit = max(1, min(int(limit), 3000))
+        if state:
+            cur = self.conn.execute(
+                "SELECT match_id FROM pr_matches WHERE state=? ORDER BY created_at DESC LIMIT ?",
+                (state, limit),
+            )
+        else:
+            cur = self.conn.execute("SELECT match_id FROM pr_matches ORDER BY created_at DESC LIMIT ?", (limit,))
+        return [self.get_match(r["match_id"]) for r in cur.fetchall()]
+
+    def deliver_result(self, *, actor: str, match_id: str, result_blob: bytes, meta: TJSON) -> Match:
+        m = self.get_match(match_id)
+        if m.state != "matched":
+            raise Conflict("match not deliverable")
+        if len(result_blob) > 2_500_000:
+            raise BadRequest("result too large")
+        h = hashlib.sha256(result_blob).hexdigest()
+        now = iso_utc()
+        self.conn.execute(
+            "UPDATE pr_matches SET state=?, result_hash=?, meta_json=? WHERE match_id=?",
+            ("delivered", h, json_dumps(meta, pretty=False), match_id),
+        )
+        self._audit(actor, "match.deliver", match_id, {"result_hash": h, "bytes": len(result_blob), "at": now})
+        return self.get_match(match_id)
+
+    def finalize_match(self, *, actor: str, match_id: str, fee_bps: int = 247, treasury_owner: str = "treasury") -> Match:
+        m = self.get_match(match_id)
+        if m.state != "delivered":
+            raise Conflict("match not finalizable")
+        fee_bps = max(0, min(int(fee_bps), 900))
+        fee = m.total_price * (fee_bps / 10_000.0)
+        pay = m.total_price - fee
+        ticket = self.get_ticket(m.ticket_id)
+        self.credit(actor=actor, owner_id="router", token_symbol=ticket.token_symbol, delta=-m.total_price, reason="escrow.release")
+        self.credit(actor=actor, owner_id=m.provider_id, token_symbol=ticket.token_symbol, delta=pay, reason="provider.payout")
+        self.credit(actor=actor, owner_id=treasury_owner, token_symbol=ticket.token_symbol, delta=fee, reason="router.fee")
+        self.conn.execute("UPDATE pr_matches SET state=? WHERE match_id=?", ("finalized", match_id))
+        self._audit(actor, "match.finalize", match_id, {"fee_bps": fee_bps, "fee": fee, "pay": pay})
+        # Also open new capacity by setting offer/ticket to closed rather than matched.
+        self.conn.execute("UPDATE pr_tickets SET status=? WHERE ticket_id=?", ("closed", m.ticket_id))
+        self.conn.execute("UPDATE pr_offers SET status=? WHERE offer_id=?", ("closed", m.offer_id))
+        return self.get_match(match_id)
+
+
+class Matcher:
+    def __init__(self, st: Storage):
+        self.st = st
+
+    def _offer_score(self, provider: Provider, offer: Offer, ticket: Ticket) -> float:
+        # Lower price wins, higher provider score wins, earlier expiry penalized.
+        price_component = (ticket.max_total / max(offer.unit_price * ticket.units, 1e-9))
+        score_component = provider.score
+        caps_bonus = 0.0
+        if provider.caps.gpu and ticket.req.gpu_required:
+            caps_bonus += 0.55
+        if provider.caps.isolation == "tee":
+            caps_bonus += 0.22
+        if "green" in (label.lower() for label in provider.caps.labels):
+            caps_bonus += 0.14
+        # Expiry distance
+        now = utc_now()
+        exp_offer = parse_iso_utc(offer.valid_until)
+        exp_ticket = parse_iso_utc(ticket.valid_until)
+        exp_s = min((exp_offer - now).total_seconds(), (exp_ticket - now).total_seconds())
+        expiry_component = clamp(exp_s / 3600.0, 0.1, 48.0) / 8.0
+        raw = 0.80 * price_component + 0.75 * score_component + 0.30 * expiry_component + caps_bonus
+        return clamp(raw, 0.01, 999.0)
+
