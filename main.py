@@ -434,3 +434,112 @@ class Provider:
     created_at: str
     updated_at: str
     state: str
+    display_name: str
+    payout_ref: str
+    score: float
+    stake: float
+    caps: ProviderCaps
+    meta: TJSON
+
+
+@dataclasses.dataclass(frozen=True)
+class Offer:
+    offer_id: str
+    provider_id: str
+    created_at: str
+    valid_until: str
+    token_symbol: str
+    unit_price: float
+    capacity_units: int
+    caps_hash: str
+    caps: ProviderCaps
+    terms: TJSON
+    status: str
+
+
+@dataclasses.dataclass(frozen=True)
+class Ticket:
+    ticket_id: str
+    client_id: str
+    created_at: str
+    valid_until: str
+    deliver_by: str
+    token_symbol: str
+    max_total: float
+    units: int
+    req_hash: str
+    req: TicketReq
+    meta: TJSON
+    status: str
+
+
+@dataclasses.dataclass(frozen=True)
+class Match:
+    match_id: str
+    created_at: str
+    ticket_id: str
+    offer_id: str
+    provider_id: str
+    units: int
+    total_price: float
+    score: float
+    state: str
+    result_hash: str | None
+    meta: TJSON
+
+
+def _random_display_name() -> str:
+    words = [
+        "saffron",
+        "krypton",
+        "matrix",
+        "lake",
+        "ember",
+        "vertex",
+        "garden",
+        "vortex",
+        "lime",
+        "horizon",
+        "riven",
+        "delta",
+        "ridge",
+        "zenith",
+        "tundra",
+        "cosmic",
+        "watt",
+        "cipher",
+        "spline",
+        "pulsar",
+        "copper",
+        "aurora",
+    ]
+    a = secrets.choice(words)
+    b = secrets.choice(words)
+    x = secrets.randbelow(8999) + 101
+    return f"{a}-{b}-{x}"
+
+
+def _safe_float(x: t.Any, *, what: str) -> float:
+    try:
+        v = float(x)
+    except Exception:
+        raise BadRequest(f"{what} must be a number")
+    if not (v == v) or v in (float("inf"), float("-inf")):
+        raise BadRequest(f"{what} must be finite")
+    return v
+
+
+def _safe_int(x: t.Any, *, what: str) -> int:
+    try:
+        v = int(x)
+    except Exception:
+        raise BadRequest(f"{what} must be an integer")
+    return v
+
+
+def _must_nonempty_str(x: t.Any, *, what: str, max_len: int = 200) -> str:
+    if not isinstance(x, str) or not x.strip():
+        raise BadRequest(f"{what} must be a non-empty string")
+    s = x.strip()
+    if len(s) > max_len:
+        raise BadRequest(f"{what} too long")
