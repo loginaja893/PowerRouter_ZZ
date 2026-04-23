@@ -325,3 +325,112 @@ def _migrations() -> list[tuple[int, str]]:
               token_symbol TEXT NOT NULL,
               balance REAL NOT NULL,
               updated_at TEXT NOT NULL,
+              PRIMARY KEY(owner_id, token_symbol)
+            );
+            """,
+        ),
+    ]
+
+
+def db_bootstrap(conn: sqlite3.Connection) -> None:
+    conn.execute("BEGIN")
+    try:
+        for _, sql in _migrations():
+            conn.executescript(sql)
+        conn.execute("INSERT OR IGNORE INTO pr_meta(k,v) VALUES(?,?)", ("schema_version", "7"))
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+
+def db_tx(conn: sqlite3.Connection) -> t.Iterator[sqlite3.Connection]:
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield conn
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+
+def dict_row(row: sqlite3.Row) -> TJSON:
+    return {k: row[k] for k in row.keys()}
+
+
+def _ensure_jsonable(obj: t.Any) -> t.Any:
+    if obj is None:
+        return None
+    if isinstance(obj, (str, int, float, bool)):
+        return obj
+    if isinstance(obj, (list, tuple)):
+        return [_ensure_jsonable(x) for x in obj]
+    if isinstance(obj, dict):
+        return {str(k): _ensure_jsonable(v) for k, v in obj.items()}
+    if dataclasses.is_dataclass(obj):
+        return _ensure_jsonable(dataclasses.asdict(obj))
+    return str(obj)
+
+
+def audit_hash(action: str, payload: TJSON) -> str:
+    core = {"action": action, "payload": _ensure_jsonable(payload)}
+    return stable_hash(core)
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderCaps:
+    gpu: bool
+    cpu_arch: str
+    ram_gb: int
+    vram_gb: int
+    regions: list[str]
+    labels: list[str]
+    isolation: str
+    net_mbps: int
+
+    def hash(self) -> str:
+        return stable_hash(dataclasses.asdict(self))
+
+    def satisfies(self, req: "TicketReq") -> bool:
+        if req.gpu_required and not self.gpu:
+            return False
+        if req.min_ram_gb and self.ram_gb < req.min_ram_gb:
+            return False
+        if req.min_vram_gb and self.vram_gb < req.min_vram_gb:
+            return False
+        if req.min_net_mbps and self.net_mbps < req.min_net_mbps:
+            return False
+        if req.cpu_arch and req.cpu_arch != self.cpu_arch:
+            return False
+        if req.isolation and req.isolation != self.isolation:
+            return False
+        if req.regions_any:
+            if not set(req.regions_any).intersection(self.regions):
+                return False
+        if req.labels_all:
+            if not set(req.labels_all).issubset(set(self.labels)):
+                return False
+        return True
+
+
+@dataclasses.dataclass(frozen=True)
+class TicketReq:
+    gpu_required: bool
+    cpu_arch: str
+    min_ram_gb: int
+    min_vram_gb: int
+    min_net_mbps: int
+    regions_any: list[str]
+    labels_all: list[str]
+    isolation: str
+
+    def hash(self) -> str:
+        return stable_hash(dataclasses.asdict(self))
+
+
+@dataclasses.dataclass(frozen=True)
+class Provider:
+    provider_id: str
+    created_at: str
+    updated_at: str
+    state: str
