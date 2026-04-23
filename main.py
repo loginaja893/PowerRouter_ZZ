@@ -979,3 +979,112 @@ class Storage:
         )
 
     def list_tickets(self, *, status: str = "open", limit: int = 200) -> list[Ticket]:
+        limit = max(1, min(int(limit), 2000))
+        cur = self.conn.execute(
+            "SELECT ticket_id FROM pr_tickets WHERE status=? ORDER BY created_at DESC LIMIT ?",
+            (status, limit),
+        )
+        return [self.get_ticket(r["ticket_id"]) for r in cur.fetchall()]
+
+    def close_ticket(self, *, actor: str, ticket_id: str, reason: str) -> Ticket:
+        reason = _must_nonempty_str(reason, what="reason", max_len=140)
+        row = self.conn.execute("SELECT status FROM pr_tickets WHERE ticket_id=?", (ticket_id,)).fetchone()
+        if row is None:
+            raise NotFound("ticket not found")
+        if row["status"] != "open":
+            raise Conflict("ticket not open")
+        self.conn.execute("UPDATE pr_tickets SET status=? WHERE ticket_id=?", ("closed", ticket_id))
+        self._audit(actor, "ticket.close", ticket_id, {"reason": reason})
+        return self.get_ticket(ticket_id)
+
+    # ---- credits ----
+
+    def _get_credit(self, owner_id: str, token_symbol: str) -> float:
+        row = self.conn.execute(
+            "SELECT balance FROM pr_credits WHERE owner_id=? AND token_symbol=?",
+            (owner_id, token_symbol),
+        ).fetchone()
+        return float(row["balance"]) if row is not None else 0.0
+
+    def credit(self, *, actor: str, owner_id: str, token_symbol: str, delta: float, reason: str) -> float:
+        token_symbol = _validate_token_symbol(token_symbol)
+        delta = _safe_float(delta, what="delta")
+        if delta == 0:
+            return self._get_credit(owner_id, token_symbol)
+        reason = _must_nonempty_str(reason, what="reason", max_len=140)
+        cur = self._get_credit(owner_id, token_symbol)
+        nxt = cur + delta
+        if nxt < -1e-9:
+            raise Integrity("insufficient balance")
+        now = iso_utc()
+        self.conn.execute(
+            "INSERT INTO pr_credits(owner_id,token_symbol,balance,updated_at) VALUES(?,?,?,?) "
+            "ON CONFLICT(owner_id,token_symbol) DO UPDATE SET balance=excluded.balance, updated_at=excluded.updated_at",
+            (owner_id, token_symbol, nxt, now),
+        )
+        self._audit(actor, "credit.delta", f"{owner_id}:{token_symbol}", {"delta": delta, "reason": reason, "prior": cur, "next": nxt})
+        return nxt
+
+    def credits_of(self, owner_id: str) -> dict[str, float]:
+        cur = self.conn.execute("SELECT token_symbol,balance FROM pr_credits WHERE owner_id=? ORDER BY token_symbol", (owner_id,))
+        out: dict[str, float] = {}
+        for r in cur.fetchall():
+            out[r["token_symbol"]] = float(r["balance"])
+        return out
+
+    # ---- matches ----
+
+    def create_match(
+        self,
+        *,
+        actor: str,
+        ticket_id: str,
+        offer_id: str,
+        units: int,
+        total_price: float,
+        score: float,
+        meta: TJSON,
+    ) -> Match:
+        ticket = self.get_ticket(ticket_id)
+        offer = self.get_offer(offer_id)
+        if ticket.status != "open":
+            raise Conflict("ticket not open")
+        if offer.status != "open":
+            raise Conflict("offer not open")
+
+        now = utc_now()
+        if parse_iso_utc(ticket.valid_until) <= now:
+            raise Conflict("ticket expired")
+        if parse_iso_utc(offer.valid_until) <= now:
+            raise Conflict("offer expired")
+
+        if ticket.token_symbol != offer.token_symbol:
+            raise BadRequest("token mismatch")
+        if units <= 0:
+            raise BadRequest("units must be > 0")
+        if units > ticket.units:
+            raise BadRequest("units exceed ticket")
+        if units > offer.capacity_units:
+            raise BadRequest("units exceed offer capacity")
+        total_price = _safe_float(total_price, what="total_price")
+        if total_price <= 0:
+            raise BadRequest("total_price must be > 0")
+        if total_price > ticket.max_total + 1e-9:
+            raise BadRequest("total_price exceeds ticket max_total")
+        score = _safe_float(score, what="score")
+        if len(json_dumps(meta).encode("utf-8")) > 12_000:
+            raise BadRequest("meta too large")
+
+        match_id = "mat_" + uuid.uuid4().hex
+        created_at = iso_utc()
+        self.conn.execute(
+            "INSERT INTO pr_matches(match_id,created_at,ticket_id,offer_id,provider_id,units,total_price,score,state,result_hash,meta_json) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                match_id,
+                created_at,
+                ticket_id,
+                offer_id,
+                offer.provider_id,
+                units,
+                total_price,
