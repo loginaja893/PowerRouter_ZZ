@@ -1524,3 +1524,112 @@ class Handler(http.server.BaseHTTPRequestHandler):
             max_total = _safe_float(body.get("max_total", 10.0), what="max_total")
             units = _safe_int(body.get("units", 1), what="units")
             valid_mins = _safe_int(body.get("valid_mins", 30), what="valid_mins")
+            deliver_mins = _safe_int(body.get("deliver_mins", 180), what="deliver_mins")
+            if valid_mins < 5 or valid_mins > 12 * 60:
+                raise BadRequest("valid_mins out of range")
+            if deliver_mins < valid_mins + 10 or deliver_mins > 19 * 24 * 60:
+                raise BadRequest("deliver_mins out of range")
+            valid_until = iso_utc(utc_now() + _dt.timedelta(minutes=valid_mins))
+            deliver_by = iso_utc(utc_now() + _dt.timedelta(minutes=deliver_mins))
+            req = _coerce_req(t.cast(TJSON, body.get("req", {})))
+            meta = t.cast(TJSON, body.get("meta", {})) if isinstance(body.get("meta", {}), dict) else {}
+            tix = self.app.st.create_ticket(
+                actor=actor,
+                client_id=client_id,
+                valid_until=valid_until,
+                deliver_by=deliver_by,
+                token_symbol=token_symbol,
+                max_total=max_total,
+                units=units,
+                req=req,
+                meta=meta,
+            )
+            return json_response(self, 201, {"ticket": dataclasses.asdict(tix) | {"req": dataclasses.asdict(tix.req)}})
+        if method == "POST" and len(parts) == 3 and parts[0] == "tickets" and parts[2] == "close":
+            body = parse_json_body(self, cfg.max_body_bytes)
+            reason = _must_nonempty_str(body.get("reason", "manual"), what="reason", max_len=140)
+            tix = self.app.st.close_ticket(actor=actor, ticket_id=parts[1], reason=reason)
+            return json_response(self, 200, {"ticket": dataclasses.asdict(tix) | {"req": dataclasses.asdict(tix.req)}})
+
+        # matcher
+        if method == "GET" and parts == ["matches", "suggest"]:
+            qp = qparams(self.path)
+            limit = int(qp.get("limit", "50"))
+            picks = self.app.matcher.suggest_matches(limit=limit)
+            return json_response(self, 200, {"suggestions": picks})
+        if method == "POST" and parts == ["matches", "execute"]:
+            body = parse_json_body(self, cfg.max_body_bytes)
+            limit = _safe_int(body.get("limit", 1), what="limit")
+            if limit < 1 or limit > self.app.cfg.match_batch_limit:
+                raise BadRequest("limit out of range")
+            out = self.app.matcher.execute_best(actor=actor, limit=limit)
+            items = [dataclasses.asdict(m) for m in out]
+            return json_response(self, 200, {"matches": items})
+        if method == "GET" and parts == ["matches"]:
+            qp = qparams(self.path)
+            state = qp.get("state")
+            limit = int(qp.get("limit", "200"))
+            ms = self.app.st.list_matches(state=state, limit=limit)
+            return json_response(self, 200, {"items": [dataclasses.asdict(m) for m in ms]})
+        if method == "GET" and len(parts) == 2 and parts[0] == "matches":
+            m = self.app.st.get_match(parts[1])
+            return json_response(self, 200, {"match": dataclasses.asdict(m)})
+        if method == "POST" and len(parts) == 3 and parts[0] == "matches" and parts[2] == "deliver":
+            body = parse_json_body(self, cfg.max_body_bytes)
+            blob_b64 = _must_nonempty_str(body.get("result_b64u", ""), what="result_b64u", max_len=4_000_000)
+            meta = t.cast(TJSON, body.get("meta", {})) if isinstance(body.get("meta", {}), dict) else {}
+            result = b64u_decode(blob_b64)
+            m = self.app.st.deliver_result(actor=actor, match_id=parts[1], result_blob=result, meta=meta)
+            return json_response(self, 200, {"match": dataclasses.asdict(m)})
+        if method == "POST" and len(parts) == 3 and parts[0] == "matches" and parts[2] == "finalize":
+            body = parse_json_body(self, cfg.max_body_bytes)
+            fee_bps = _safe_int(body.get("fee_bps", 247), what="fee_bps")
+            treasury = _must_nonempty_str(body.get("treasury", "treasury"), what="treasury", max_len=120)
+            m = self.app.st.finalize_match(actor=actor, match_id=parts[1], fee_bps=fee_bps, treasury_owner=treasury)
+            return json_response(self, 200, {"match": dataclasses.asdict(m)})
+
+        # audit
+        if method == "GET" and parts == ["audit"]:
+            qp = qparams(self.path)
+            limit = int(qp.get("limit", "200"))
+            items = self.app.st.list_audit(limit=limit)
+            return json_response(self, 200, {"items": items})
+
+        raise NotFound("no such route")
+
+    def do_GET(self) -> None:
+        try:
+            self._dispatch()
+        except RateLimited as e:
+            json_response(self, 429, problem(429, str(e)))
+        except Unauthorized as e:
+            json_response(self, 401, problem(401, str(e)))
+        except NotFound as e:
+            json_response(self, 404, problem(404, str(e)))
+        except BadRequest as e:
+            json_response(self, 400, problem(400, str(e)))
+        except Conflict as e:
+            json_response(self, 409, problem(409, str(e)))
+        except Integrity as e:
+            json_response(self, 422, problem(422, str(e)))
+        except Exception as e:
+            LOG.exception("unhandled")
+            json_response(self, 500, problem(500, "internal error", detail=str(e)))
+
+    def do_POST(self) -> None:
+        return self.do_GET()
+
+
+class ThreadedHTTPServer(http.server.ThreadingHTTPServer):
+    def __init__(self, addr: tuple[str, int], handler_cls: type[Handler], app: App):
+        super().__init__(addr, handler_cls)
+        self.app = app
+
+
+def run_server(cfg: AppConfig) -> None:
+    configure_logging(cfg.log_level)
+    app = App(cfg)
+    Handler.app = app
+
+    srv = ThreadedHTTPServer((cfg.http_host, cfg.http_port), Handler, app)
+    LOG.info("listening on http://%s:%d", cfg.http_host, cfg.http_port)
