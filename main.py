@@ -1306,3 +1306,112 @@ def parse_json_body(handler: http.server.BaseHTTPRequestHandler, max_bytes: int)
     return t.cast(TJSON, obj)
 
 
+def path_parts(path: str) -> list[str]:
+    p = urllib.parse.urlparse(path).path
+    parts = [x for x in p.split("/") if x]
+    return parts
+
+
+def qparams(path: str) -> dict[str, str]:
+    q = urllib.parse.urlparse(path).query
+    parsed = urllib.parse.parse_qs(q, keep_blank_values=True)
+    out: dict[str, str] = {}
+    for k, vs in parsed.items():
+        if not vs:
+            continue
+        out[k] = vs[-1]
+    return out
+
+
+def json_response(handler: http.server.BaseHTTPRequestHandler, code: int, obj: t.Any, headers: dict[str, str] | None = None) -> None:
+    raw = json_dumps(obj, pretty=False).encode("utf-8")
+    handler.send_response(code)
+    handler.send_header("Content-Type", "application/json; charset=utf-8")
+    handler.send_header("Content-Length", str(len(raw)))
+    handler.send_header("Cache-Control", "no-store")
+    if headers:
+        for k, v in headers.items():
+            handler.send_header(k, v)
+    handler.end_headers()
+    handler.wfile.write(raw)
+
+
+def problem(code: int, msg: str, *, detail: t.Any = None) -> TJSON:
+    d: TJSON = {"error": msg}
+    if detail is not None:
+        d["detail"] = detail
+    d["ts"] = iso_utc()
+    return d
+
+
+class App:
+    def __init__(self, cfg: AppConfig):
+        self.cfg = cfg
+        self.conn = sqlite_connect(cfg.db_path)
+        db_bootstrap(self.conn)
+        self.st = Storage(self.conn)
+        self.matcher = Matcher(self.st)
+        self.tokens = HmacTickets(cfg.hmac_secret_b64u)
+        self.rate = RateBucket(cfg.request_rate_window_s, cfg.request_rate_limit)
+
+    def close(self) -> None:
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+
+    # ---- auth ----
+
+    def require_admin(self, handler: http.server.BaseHTTPRequestHandler) -> None:
+        token = handler.headers.get("Authorization", "").strip()
+        if not token.startswith("Bearer "):
+            raise Unauthorized("missing bearer")
+        if token[len("Bearer ") :] != self.cfg.admin_token:
+            raise Unauthorized("bad admin token")
+
+    def issue_actor_token(self, actor_id: str, *, ttl_s: int = 6 * 3600) -> str:
+        actor_id = _must_nonempty_str(actor_id, what="actor_id", max_len=120)
+        return self.tokens.sign("actor", {"actor_id": actor_id}, ttl_s=ttl_s)
+
+    def actor_from_request(self, handler: http.server.BaseHTTPRequestHandler) -> str:
+        auth = handler.headers.get("Authorization", "").strip()
+        if auth.startswith("Bearer "):
+            tok = auth[len("Bearer ") :]
+            claims = self.tokens.verify(tok, "actor")
+            actor = _must_nonempty_str(claims.get("actor_id", ""), what="actor_id", max_len=120)
+            return actor
+        return "anonymous"
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    server_version = "PowerRouter_ZZ/1.0"
+    app: App
+
+    def log_message(self, fmt: str, *args: t.Any) -> None:
+        LOG.info("%s - %s", self.address_string(), fmt % args)
+
+    def _dispatch(self) -> None:
+        cfg = self.app.cfg
+        ip = safe_client_ip(self, allow_private=cfg.allow_private_ips)
+        self.app.rate.hit(ip)
+
+        parts = path_parts(self.path)
+        method = self.command.upper()
+
+        if method == "GET" and not parts:
+            return json_response(self, 200, {"app": cfg.app_name, "ts": iso_utc(), "db": os.path.basename(cfg.db_path)})
+
+        # health + meta
+        if method == "GET" and parts == ["health"]:
+            return json_response(self, 200, {"ok": True, "ts": iso_utc()})
+        if method == "GET" and parts == ["meta"]:
+            return json_response(
+                self,
+                200,
+                {
+                    "app": cfg.app_name,
+                    "ts": iso_utc(),
+                    "max_body": cfg.max_body_bytes,
+                    "rate_window_s": cfg.request_rate_window_s,
+                    "rate_limit": cfg.request_rate_limit,
+                    "match_batch": cfg.match_batch_limit,
+                    "match_lookback_s": cfg.match_lookback_s,
