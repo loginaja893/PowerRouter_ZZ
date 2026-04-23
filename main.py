@@ -543,3 +543,112 @@ def _must_nonempty_str(x: t.Any, *, what: str, max_len: int = 200) -> str:
     s = x.strip()
     if len(s) > max_len:
         raise BadRequest(f"{what} too long")
+    return s
+
+
+def _must_list_str(x: t.Any, *, what: str, max_len: int = 40, max_items: int = 24) -> list[str]:
+    if x is None:
+        return []
+    if not isinstance(x, list):
+        raise BadRequest(f"{what} must be a list")
+    out: list[str] = []
+    for item in x[: max_items + 1]:
+        if len(out) >= max_items:
+            raise BadRequest(f"{what} too many items")
+        out.append(_must_nonempty_str(item, what=what, max_len=max_len))
+    return out
+
+
+def _validate_token_symbol(sym: str) -> str:
+    sym = _must_nonempty_str(sym, what="token_symbol", max_len=16).upper()
+    if not all(c in (string.ascii_uppercase + string.digits + "_") for c in sym):
+        raise BadRequest("token_symbol has invalid characters")
+    return sym
+
+
+def _coerce_caps(d: TJSON) -> ProviderCaps:
+    gpu = bool(d.get("gpu", False))
+    cpu_arch = _must_nonempty_str(d.get("cpu_arch", "x86_64"), what="caps.cpu_arch", max_len=24)
+    ram_gb = max(0, _safe_int(d.get("ram_gb", 0), what="caps.ram_gb"))
+    vram_gb = max(0, _safe_int(d.get("vram_gb", 0), what="caps.vram_gb"))
+    regions = _must_list_str(d.get("regions", []), what="caps.regions", max_len=32, max_items=16)
+    labels = _must_list_str(d.get("labels", []), what="caps.labels", max_len=24, max_items=24)
+    isolation = _must_nonempty_str(d.get("isolation", "vm"), what="caps.isolation", max_len=24)
+    net_mbps = max(0, _safe_int(d.get("net_mbps", 0), what="caps.net_mbps"))
+    return ProviderCaps(
+        gpu=gpu,
+        cpu_arch=cpu_arch,
+        ram_gb=ram_gb,
+        vram_gb=vram_gb,
+        regions=regions,
+        labels=labels,
+        isolation=isolation,
+        net_mbps=net_mbps,
+    )
+
+
+def _coerce_req(d: TJSON) -> TicketReq:
+    gpu_required = bool(d.get("gpu_required", False))
+    cpu_arch = _must_nonempty_str(d.get("cpu_arch", ""), what="req.cpu_arch", max_len=24) if d.get("cpu_arch") else ""
+    min_ram_gb = max(0, _safe_int(d.get("min_ram_gb", 0), what="req.min_ram_gb"))
+    min_vram_gb = max(0, _safe_int(d.get("min_vram_gb", 0), what="req.min_vram_gb"))
+    min_net_mbps = max(0, _safe_int(d.get("min_net_mbps", 0), what="req.min_net_mbps"))
+    regions_any = _must_list_str(d.get("regions_any", []), what="req.regions_any", max_len=32, max_items=16)
+    labels_all = _must_list_str(d.get("labels_all", []), what="req.labels_all", max_len=24, max_items=24)
+    isolation = _must_nonempty_str(d.get("isolation", ""), what="req.isolation", max_len=24) if d.get("isolation") else ""
+    return TicketReq(
+        gpu_required=gpu_required,
+        cpu_arch=cpu_arch,
+        min_ram_gb=min_ram_gb,
+        min_vram_gb=min_vram_gb,
+        min_net_mbps=min_net_mbps,
+        regions_any=regions_any,
+        labels_all=labels_all,
+        isolation=isolation,
+    )
+
+
+class HmacTickets:
+    def __init__(self, secret_b64u: str):
+        self._secret = b64u_decode(secret_b64u)
+
+    def sign(self, purpose: str, claims: TJSON, *, ttl_s: int = 3600) -> str:
+        if ttl_s < 1:
+            raise BadRequest("ttl too small")
+        exp = int(time.time()) + int(ttl_s)
+        core = {"p": purpose, "exp": exp, "c": _ensure_jsonable(claims)}
+        body = json_dumps(core, pretty=False).encode("utf-8")
+        mac = hmac.new(self._secret, body, hashlib.sha256).digest()
+        return f"{b64u(body)}.{b64u(mac)}"
+
+    def verify(self, token: str, purpose: str) -> TJSON:
+        try:
+            a, b = token.split(".", 1)
+            body = b64u_decode(a)
+            mac = b64u_decode(b)
+        except Exception:
+            raise Unauthorized("bad token format")
+        want = hmac.new(self._secret, body, hashlib.sha256).digest()
+        if not hmac.compare_digest(want, mac):
+            raise Unauthorized("bad token signature")
+        try:
+            core = json.loads(body.decode("utf-8"))
+        except Exception:
+            raise Unauthorized("bad token payload")
+        if core.get("p") != purpose:
+            raise Unauthorized("bad token purpose")
+        exp = int(core.get("exp", 0))
+        if int(time.time()) > exp:
+            raise Unauthorized("token expired")
+        claims = core.get("c", {})
+        if not isinstance(claims, dict):
+            raise Unauthorized("bad token claims")
+        return t.cast(TJSON, claims)
+
+
+class RateBucket:
+    def __init__(self, window_s: int, limit: int):
+        self.window_s = int(window_s)
+        self.limit = int(limit)
+        self._lock = threading.Lock()
+        self._buckets: dict[str, list[int]] = {}
