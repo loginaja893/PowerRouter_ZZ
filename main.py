@@ -761,3 +761,112 @@ class Storage:
             state=row["state"],
             display_name=row["display_name"],
             payout_ref=row["payout_ref"],
+            score=float(row["score"]),
+            stake=float(row["stake"]),
+            caps=caps,
+            meta=t.cast(TJSON, meta),
+        )
+
+    def list_providers(self, *, state: str | None = None, limit: int = 200) -> list[Provider]:
+        limit = max(1, min(int(limit), 2000))
+        if state:
+            cur = self.conn.execute(
+                "SELECT provider_id FROM pr_providers WHERE state=? ORDER BY updated_at DESC LIMIT ?",
+                (state, limit),
+            )
+        else:
+            cur = self.conn.execute("SELECT provider_id FROM pr_providers ORDER BY updated_at DESC LIMIT ?", (limit,))
+        return [self.get_provider(r["provider_id"]) for r in cur.fetchall()]
+
+    def set_provider_state(self, *, actor: str, provider_id: str, state: str) -> Provider:
+        if state not in ("active", "suspended", "retired"):
+            raise BadRequest("invalid provider state")
+        now = iso_utc()
+        row = self.conn.execute(
+            "SELECT provider_id,state FROM pr_providers WHERE provider_id=?",
+            (provider_id,),
+        ).fetchone()
+        if row is None:
+            raise NotFound("provider not found")
+        prior = row["state"]
+        self.conn.execute("UPDATE pr_providers SET state=?, updated_at=? WHERE provider_id=?", (state, now, provider_id))
+        self._audit(actor, "provider.state", provider_id, {"prior": prior, "next": state})
+        return self.get_provider(provider_id)
+
+    # ---- offers ----
+
+    def create_offer(
+        self,
+        *,
+        actor: str,
+        provider_id: str,
+        valid_until: str,
+        token_symbol: str,
+        unit_price: float,
+        capacity_units: int,
+        terms: TJSON,
+    ) -> Offer:
+        provider = self.get_provider(provider_id)
+        if provider.state != "active":
+            raise Conflict("provider not active")
+        token_symbol = _validate_token_symbol(token_symbol)
+        unit_price = _safe_float(unit_price, what="unit_price")
+        if unit_price <= 0:
+            raise BadRequest("unit_price must be > 0")
+        capacity_units = _safe_int(capacity_units, what="capacity_units")
+        if capacity_units <= 0:
+            raise BadRequest("capacity_units must be > 0")
+        vu = parse_iso_utc(valid_until)
+        if vu <= utc_now():
+            raise BadRequest("valid_until must be in the future")
+        if len(json_dumps(terms).encode("utf-8")) > 14_000:
+            raise BadRequest("terms too large")
+        offer_id = "off_" + uuid.uuid4().hex
+        created_at = iso_utc()
+        caps_hash = provider.caps.hash()
+        caps_json = json_dumps(dataclasses.asdict(provider.caps), pretty=False)
+        self.conn.execute(
+            "INSERT INTO pr_offers(offer_id,provider_id,created_at,valid_until,token_symbol,unit_price,capacity_units,caps_hash,caps_json,terms_json,status) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                offer_id,
+                provider_id,
+                created_at,
+                iso_utc(vu),
+                token_symbol,
+                unit_price,
+                capacity_units,
+                caps_hash,
+                caps_json,
+                json_dumps(terms, pretty=False),
+                "open",
+            ),
+        )
+        self._audit(actor, "offer.create", offer_id, {"provider_id": provider_id, "token_symbol": token_symbol, "unit_price": unit_price, "capacity_units": capacity_units})
+        return self.get_offer(offer_id)
+
+    def get_offer(self, offer_id: str) -> Offer:
+        row = self.conn.execute(
+            "SELECT offer_id,provider_id,created_at,valid_until,token_symbol,unit_price,capacity_units,caps_hash,caps_json,terms_json,status "
+            "FROM pr_offers WHERE offer_id=?",
+            (offer_id,),
+        ).fetchone()
+        if row is None:
+            raise NotFound("offer not found")
+        caps = _coerce_caps(json.loads(row["caps_json"]))
+        terms = json.loads(row["terms_json"])
+        return Offer(
+            offer_id=row["offer_id"],
+            provider_id=row["provider_id"],
+            created_at=row["created_at"],
+            valid_until=row["valid_until"],
+            token_symbol=row["token_symbol"],
+            unit_price=float(row["unit_price"]),
+            capacity_units=int(row["capacity_units"]),
+            caps_hash=row["caps_hash"],
+            caps=caps,
+            terms=t.cast(TJSON, terms),
+            status=row["status"],
+        )
+
+    def list_offers(self, *, status: str = "open", limit: int = 200) -> list[Offer]:
