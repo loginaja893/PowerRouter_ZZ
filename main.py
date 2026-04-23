@@ -1197,3 +1197,112 @@ class Matcher:
         raw = 0.80 * price_component + 0.75 * score_component + 0.30 * expiry_component + caps_bonus
         return clamp(raw, 0.01, 999.0)
 
+    def suggest_matches(self, *, limit: int = 50) -> list[TJSON]:
+        offers = self.st.list_offers(status="open", limit=5000)
+        tickets = self.st.list_tickets(status="open", limit=2500)
+        if not offers or not tickets:
+            return []
+
+        providers_cache: dict[str, Provider] = {}
+        out: list[TJSON] = []
+        for tix in tickets:
+            if parse_iso_utc(tix.valid_until) <= utc_now():
+                continue
+            best: tuple[float, Offer] | None = None
+            for off in offers:
+                if off.token_symbol != tix.token_symbol:
+                    continue
+                if parse_iso_utc(off.valid_until) <= utc_now():
+                    continue
+                if off.capacity_units < tix.units:
+                    continue
+                prov = providers_cache.get(off.provider_id)
+                if prov is None:
+                    prov = self.st.get_provider(off.provider_id)
+                    providers_cache[off.provider_id] = prov
+                if prov.state != "active":
+                    continue
+                if not prov.caps.satisfies(tix.req):
+                    continue
+                total_price = off.unit_price * tix.units
+                if total_price > tix.max_total + 1e-9:
+                    continue
+                s = self._offer_score(prov, off, tix)
+                if best is None or s > best[0]:
+                    best = (s, off)
+            if best is None:
+                continue
+            score, off = best
+            out.append(
+                {
+                    "ticket_id": tix.ticket_id,
+                    "offer_id": off.offer_id,
+                    "provider_id": off.provider_id,
+                    "units": tix.units,
+                    "total_price": round(off.unit_price * tix.units, 10),
+                    "score": round(score, 10),
+                }
+            )
+        out.sort(key=lambda x: float(x["score"]), reverse=True)
+        return out[: max(0, int(limit))]
+
+    def execute_best(self, *, actor: str, limit: int = 1) -> list[Match]:
+        picks = self.suggest_matches(limit=max(1, int(limit)))
+        out: list[Match] = []
+        for pick in picks:
+            m = self.st.create_match(
+                actor=actor,
+                ticket_id=pick["ticket_id"],
+                offer_id=pick["offer_id"],
+                units=int(pick["units"]),
+                total_price=float(pick["total_price"]),
+                score=float(pick["score"]),
+                meta={"engine": "PowerRouter_ZZ", "picked_at": iso_utc()},
+            )
+            out.append(m)
+        return out
+
+
+def safe_client_ip(handler: http.server.BaseHTTPRequestHandler, *, allow_private: bool) -> str:
+    addr = handler.client_address[0]
+    try:
+        ip = ipaddress.ip_address(addr)
+    except Exception:
+        return "unknown"
+    if not allow_private and (ip.is_private or ip.is_loopback or ip.is_link_local):
+        raise Unauthorized("private ip not allowed")
+    return str(ip)
+
+
+def read_body(handler: http.server.BaseHTTPRequestHandler, max_bytes: int) -> bytes:
+    ln = handler.headers.get("Content-Length")
+    if ln is None:
+        return b""
+    try:
+        n = int(ln)
+    except Exception:
+        raise BadRequest("invalid Content-Length")
+    if n < 0 or n > max_bytes:
+        raise BadRequest("body too large")
+    data = handler.rfile.read(n)
+    if len(data) != n:
+        raise BadRequest("short read")
+    return data
+
+
+def parse_json_body(handler: http.server.BaseHTTPRequestHandler, max_bytes: int) -> TJSON:
+    data = read_body(handler, max_bytes)
+    if not data:
+        return {}
+    ctype = handler.headers.get("Content-Type", "")
+    if "application/json" not in ctype:
+        raise BadRequest("Content-Type must be application/json")
+    try:
+        obj = json.loads(data.decode("utf-8"))
+    except Exception:
+        raise BadRequest("invalid json")
+    if not isinstance(obj, dict):
+        raise BadRequest("json body must be an object")
+    return t.cast(TJSON, obj)
+
+
